@@ -7,7 +7,7 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    # The npm trusted publisher is bound to this environment; add required reviewers to it to gate releases.
+    # The npm trusted publisher is bound to this environment.
     environment: npm
     permissions:
       contents: read
@@ -17,10 +17,12 @@ jobs:
 
       - uses: actions/setup-node@v7
         with:
-          # npm 11.5+ (bundled with Node 24) is needed for Trusted Publishing.
           node-version: 24
           registry-url: https://registry.npmjs.org
           cache: npm
+
+      # `npm stage publish` needs npm 11.15+, newer than the npm bundled with Node 24.
+      - run: npm install -g npm@11
 
       - name: Tag matches package.json version
         run: |
@@ -36,14 +38,21 @@ jobs:
       - run: npm run build
       - run: npm run check:package
 
-      - name: Publish to npm
-        run: npm publish --provenance --access public
-        env:
-          # Bootstrap for the very first release only: a trusted publisher can be configured on npmjs.com only
-          # for a package that already exists, so v0.1.0 needs an automation token in the NPM_TOKEN secret.
-          # Afterwards configure the trusted publisher (repo fake-email-pro/fake-email-js, workflow release.yml,
-          # environment npm) and delete the secret: npm then authenticates through OIDC, and this is empty.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Staged, not published: the trusted publisher (repo fake-email-pro/fake-email-js, workflow release.yml,
+      # environment npm) allows `npm stage publish` only, and a maintainer approves the version with 2FA on
+      # npmjs.com (package → Staged Packages) or with `npm stage approve <stage-id>`.
+      - name: Stage on npm
+        run: npm stage publish --provenance --access public
+
+      - name: Say where to approve
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          {
+            echo "### fake-email-pro@${version} is staged on npm"
+            echo
+            echo "Approve it with 2FA at https://www.npmjs.com/package/fake-email-pro (Staged Packages),"
+            echo "or run \`npm stage list fake-email-pro\` and \`npm stage approve <stage-id>\`."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   github-release:
     needs: publish
