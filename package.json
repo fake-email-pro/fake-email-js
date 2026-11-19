@@ -1,0 +1,84 @@
+{
+  "name": "fake-email-pro",
+  "version": "0.1.0",
+  "description": "Official client for the fake-email.pro API: disposable mailboxes for testing signup, OTP and magic-link emails.",
+  "keywords": [
+    "temp mail",
+    "temp-mail",
+    "temporary email",
+    "disposable email",
+    "fake email",
+    "email testing",
+    "otp",
+    "verification code",
+    "e2e",
+    "playwright",
+    "cypress",
+    "testing",
+    "inbox",
+    "mailbox",
+    "api",
+    "sdk"
+  ],
+  "homepage": "https://fake-email.pro/api",
+  "bugs": {
+    "url": "https://github.com/fake-email-pro/fake-email-js/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fake-email-pro/fake-email-js.git"
+  },
+  "license": "MIT",
+  "author": "fake-email.pro (https://fake-email.pro)",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "gen:api": "openapi-typescript openapi/public.yaml -o src/generated/public.ts",
+    "typecheck": "tsc --noEmit -p . && tsc --noEmit -p test",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:live": "FAKE_EMAIL_LIVE=1 vitest run test/live.test.ts",
+    "build": "tsup",
+    "check:package": "publint && attw --pack .",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
+    "@types/node": "^22.20.5",
+    "openapi-typescript": "^7.13.0",
+    "publint": "^0.3.25",
+    "tsup": "^8.5.1",
+    "typescript": "~5.9.3",
+    "vite": "^6.4.6",
+    "vitest": "^3.2.7"
+  }
+}

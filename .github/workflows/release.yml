@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # The npm trusted publisher is bound to this environment; add required reviewers to it to gate releases.
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write # npm provenance and Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          # npm 11.5+ (bundled with Node 24) is needed for Trusted Publishing.
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Tag matches package.json version
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${version} (expected v${version})"
+            exit 1
+          fi
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm run check:package
+
+      - name: Publish to npm
+        run: npm publish --provenance --access public
+        env:
+          # Bootstrap for the very first release only: a trusted publisher can be configured on npmjs.com only
+          # for a package that already exists, so v0.1.0 needs an automation token in the NPM_TOKEN secret.
+          # Afterwards configure the trusted publisher (repo fake-email-pro/fake-email-js, workflow release.yml,
+          # environment npm) and delete the secret: npm then authenticates through OIDC, and this is empty.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release
+    steps:
+      - name: Create a GitHub Release from the tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --title "${GITHUB_REF_NAME}"
+          --generate-notes --verify-tag

@@ -1,0 +1,1303 @@
+openapi: 3.1.0
+
+info:
+  title: fake-email.pro Public API
+  version: v1
+  summary: Disposable mailboxes over HTTP for CI, SDKs and curl.
+  description: |
+    Create a disposable mailbox, wait for an email, and pull a one-time code or a link out of it.
+
+    **Server-to-server; do not call from browser JavaScript.** There is no CORS, and `OPTIONS` answers `405`: a key
+    in a frontend is visible to every visitor.
+
+    **Key.** Every request carries `Authorization: Bearer fep_…`. A key is issued on the website and shown only once;
+    all keys of a user share that user's limits and quota.
+
+    **Limits.** The numbers depend on the plan and can change without a release – read `GET /v1/limits` (your own)
+    and `GET /v1/plans` on the website's own origin, e.g. `https://fake-email.pro/v1/plans`, no key needed (every plan).
+    - *Rate limit* – requests per minute per user, in a fixed window. Its state is in the `X-RateLimit-Limit`,
+      `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers on every response after the key check; going over
+      is `429 rate_limit_exceeded` with `Retry-After`.
+    - *Quota* – mailboxes per calendar month in UTC. Only `POST /v1/mailboxes` spends it; running out is `402`.
+    - *Waits* – `wait` requests held open at once per user; past the cap, `429 too_many_waits` with `Retry-After: 1`.
+
+    **Errors.** Every error is `application/json`, `{"error":"<code>","message":"<phrase>"}`. Tell errors apart by
+    `error` (`ErrorCode`); `message` is a fixed English phrase for the developer. Besides the ones listed on an
+    operation, any response may be one of the `default` errors: `400 bad_request` (a parameter of the wrong type),
+    `403 plan_forbidden` (the plan has no API access), `404 not_found` (unknown path), `405 method_not_allowed`,
+    `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_server_error`, `503 internal_server_error`
+    (the server is temporarily out of database connections or, for a full message and an attachment, its memory
+    budget for reading messages is in use; with `Retry-After`).
+
+    **Conventions.** Times are RFC 3339 in UTC, always with milliseconds: `2026-10-22T18:01:02.123Z`. Fields whose
+    value is `null` are present; an empty list is `[]`. Enum values are UPPERCASE, error codes lowercase. Lists take
+    `page` (zero-based) and `size` (`1..50`, `20` by default); the sort order always ends with `id`.
+
+    **A mailbox** accepts mail for 24 hours and cannot be renewed. An expired mailbox answers `404` on every endpoint
+    at once and is deleted soon after, together with its messages; a message lives as long as its mailbox. The
+    Public API sees only mailboxes created through the Public API.
+
+    **Examples** use `example.org` and `example.net` in place of real mail domains: the pool changes over time, so
+    take a current one from `GET /v1/domains`.
+
+servers:
+  - url: http://localhost:8082
+    description: local
+  - url: https://api.fake-email.pro
+    description: prod
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Mailboxes
+    description: Disposable mailboxes. A mailbox accepts mail for 24 hours; an address is never handed out again.
+  - name: Messages
+    description: A mailbox's messages, waiting for a message (long poll), the raw EML and attachments.
+  - name: Domains
+    description: Domains you can create a mailbox on.
+  - name: Limits
+    description: The current user's quota, limits and storage.
+
+paths:
+  # ───────────────────────────── Mailboxes ─────────────────────────────
+  /v1/mailboxes:
+    post:
+      tags: [Mailboxes]
+      operationId: createMailbox
+      summary: Create a mailbox
+      description: >-
+        With no body – a random address on a random domain; with `domain` – a random address on that domain;
+        with `localPart` and `domain` – exactly that address. The mailbox accepts mail for 24 hours. Spends one
+        unit of the monthly quota. Checks run in this order: body (`400`) → a custom `localPart` on a plan that
+        does not allow it (`403`) → domain (`404`; with no `domain` and no domain available for new mailboxes –
+        `503`) → `localPart` format (`400`) → quota (`402`) → address taken (`409`). The quota is checked
+        atomically with creation: concurrent requests cannot exceed it.
+      requestBody:
+        required: false
+        description: Optional; no body, `{}` and `null` fields all mean the same as leaving them out.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMailboxRequest'
+            examples:
+              random:
+                summary: Random address
+                value: {}
+              randomOnDomain:
+                summary: Random address on a domain
+                value:
+                  domain: example.org
+              exactAddress:
+                summary: Exactly this address
+                value:
+                  localPart: ci-runner-7
+                  domain: example.org
+      responses:
+        '201':
+          description: The created mailbox.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Mailbox'
+              example:
+                address: ci-runner-7@example.org
+                activeSince: '2026-10-22T09:00:00.481Z'
+                expiresAt: '2026-10-23T09:00:00.481Z'
+                storageUsedBytes: 0
+                messagesCount: 0
+        '400':
+          description: '`localPart` without `domain`; `localPart` does not match the format or is reserved; the body has the wrong shape.'
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                noDomain:
+                  value: { error: bad_request, message: localPart requires domain }
+                badLocalPart:
+                  value: { error: bad_request, message: invalid localPart }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/QuotaExhausted'
+        '403':
+          description: A custom `localPart` on a plan without `allowCustomLocalPart`.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: plan_forbidden
+                message: plan does not allow custom localPart
+        '404':
+          description: '`domain` is not visible to the user (it does not exist, is not available for new mailboxes, or is `PREMIUM` and the plan does not allow it).'
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: not_found
+                message: domain not found
+        '409':
+          description: The address has already been issued – to anyone and in any state, your own deleted mailbox included.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: address_taken
+                message: address taken
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          description: >-
+            No domain is available for new mailboxes (all are being retired or are disabled) – an operational
+            state, not a failure; retry after `Retry-After` (60 s). No quota is spent.
+          headers:
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: internal_server_error
+                message: service unavailable
+        default:
+          $ref: '#/components/responses/Error'
+
+    get:
+      tags: [Mailboxes]
+      operationId: listMailboxes
+      summary: List active mailboxes
+      description: >-
+        Active mailboxes only (expired and deleted ones are not listed), newest first: by creation time (that is,
+        `activeSince`) descending, then `id`.
+      parameters:
+        - $ref: '#/components/parameters/PageQuery'
+        - $ref: '#/components/parameters/SizeQuery'
+      responses:
+        '200':
+          description: A page of mailboxes.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MailboxPage'
+              example:
+                content:
+                  - address: quiet.harbor.42@example.org
+                    activeSince: '2026-10-22T09:00:00.000Z'
+                    expiresAt: '2026-10-23T09:00:00.000Z'
+                    storageUsedBytes: 18422
+                    messagesCount: 3
+                page: 0
+                size: 20
+                totalPages: 1
+                totalElements: 1
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Error'
+
+  /v1/mailboxes/{address}:
+    parameters:
+      - $ref: '#/components/parameters/Address'
+    get:
+      tags: [Mailboxes]
+      operationId: getMailbox
+      summary: Get a mailbox
+      description: An active mailbox of the caller. An expired or deleted mailbox, someone else's, or one created on the website returns `404`.
+      responses:
+        '200':
+          description: The mailbox.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Mailbox'
+              example:
+                address: quiet.harbor.42@example.org
+                activeSince: '2026-10-22T09:00:00.000Z'
+                expiresAt: '2026-10-23T09:00:00.000Z'
+                storageUsedBytes: 18422
+                messagesCount: 3
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/MailboxNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Error'
+
+    delete:
+      tags: [Mailboxes]
+      operationId: deleteMailbox
+      summary: Delete a mailbox
+      description: >-
+        Its messages are erased immediately. The address stays taken forever, the quota is not given back, and
+        the mailbox cannot be restored. Pending `wait` requests on this mailbox end with `404` within 5 s.
+        Deleting it again returns `404`.
+      responses:
+        '204':
+          description: Deleted.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/MailboxNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Error'
+
+  # ───────────────────────────── Messages ─────────────────────────────
+  /v1/mailboxes/{address}/messages:
+    parameters:
+      - $ref: '#/components/parameters/Address'
+    get:
+      tags: [Messages]
+      operationId: listMessages
+      summary: List messages
+      description: >-
+        Newest first: `createdAt` descending, then `id`. To watch for new messages, use
+        `GET …/messages/wait` rather than polling the list. Checks run in this order: `page`/`size` (`400`) →
+        mailbox (`404`).
+      parameters:
+        - $ref: '#/components/parameters/PageQuery'
+        - $ref: '#/components/parameters/SizeQuery'
+      responses:
+        '200':
+          description: A page of messages.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessagePage'
+              example:
+                content:
+                  - id: 3c1b5f0e-6a8e-4b0e-9d3e-1f2a7c9b8e41
+                    mailboxAddress: quiet.harbor.42@example.org
+                    createdAt: '2026-10-22T09:05:12.481Z'
+                    sizeBytes: 18422
+                    from: { name: Acme, address: no-reply@acme.example }
+                    subject: Your verification code
+                    bodyState: STORED
+                    attachmentsCount: 0
+                    code: '550712'
+                    confirmLink: https://acme.example/verify?t=3f9a
+                page: 0
+                size: 20
+                totalPages: 1
+                totalElements: 1
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/MailboxNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Error'
+
+  /v1/mailboxes/{address}/messages/wait:
+    parameters:
+      - $ref: '#/components/parameters/Address'
+    get:
+      tags: [Messages]
+      operationId: waitForMessage
+      summary: Wait for a message (long poll)
+      description: |
+        The mailbox's earliest message that arrived strictly after `after` and matches the filters, in ascending
+        (`createdAt`, `id`) order. If there is one already, `200` right away; if not, the request is held open
+        until a message arrives (`200`, usually less than a second after delivery and no later than 5 s) or until
+        `timeout` (`204` – repeat the request).
+
+        Without `after`, any message of the mailbox matches: a message that arrived before the call, or between a
+        `204` and the retry, is not lost. To continue after a message you received, pass `after=<its id>`. A time
+        in `after` is for "messages since moment X" (for example, the `Date` header of the response that created
+        the mailbox); do not pass a message's `createdAt` as `after`: a second message in the same millisecond
+        would be skipped.
+
+        Spends one request of the rate limit, however long it is held open. Waits held open at once per user are
+        capped at `concurrentWaits` from `GET /v1/limits`; past that, `429 too_many_waits`. When the server
+        restarts, pending waits get `204`.
+
+        Checks run in this order: `timeout`, `after` format (`400`) → mailbox (`404`) → the message in `after`
+        (`404`) → a message already there (`200`) → a wait slot (`429`) → waiting.
+      parameters:
+        - name: timeout
+          in: query
+          required: false
+          description: How many seconds to wait, an integer `1..60`; otherwise `400`.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 60
+            default: 30
+        - name: after
+          in: query
+          required: false
+          description: >-
+            The `id` of a message in this mailbox – strictly after it in (`createdAt`, `id`) order; or an
+            RFC 3339 time with any offset – `createdAt`, truncated to milliseconds, strictly greater (encode `+`
+            in the URL as `%2B`). Any other format is `400`; the `id` of a message that is not in the mailbox
+            (a deleted one included) is `404`.
+          schema:
+            type: string
+          examples:
+            messageId:
+              summary: id of the last message received
+              value: 3c1b5f0e-6a8e-4b0e-9d3e-1f2a7c9b8e41
+            time:
+              summary: Since the mailbox was created (Date header)
+              value: '2026-10-22T09:00:00Z'
+        - name: from
+          in: query
+          required: false
+          description: >-
+            Case-insensitive substring of the sender address (`from.address`). An empty value means no filter.
+            A message without `from` does not match.
+          schema:
+            type: string
+          example: acme.example
+        - name: subject
+          in: query
+          required: false
+          description: >-
+            Case-insensitive substring of the subject. An empty value means no filter. A message without a
+            subject (`null`) does not match.
+          schema:
+            type: string
+          example: verification code
+      responses:
+        '200':
+          description: The matching message, in list-item form (with `code` and `confirmLink`); the full message is at `GET …/messages/{id}`.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleMessage'
+              example:
+                id: 5d2e8a10-7b3c-4f1e-8a2d-9c4b6e1f3a57
+                mailboxAddress: quiet.harbor.42@example.org
+                createdAt: '2026-10-22T09:06:40.102Z'
+                sizeBytes: 9120
+                from: { name: Acme, address: no-reply@acme.example }
+                subject: Your verification code
+                bodyState: STORED
+                attachmentsCount: 0
+                code: '048213'
+                confirmLink: https://acme.example/verify?t=3f9a
+        '204':
+          description: No matching message arrived within `timeout` (or the server is restarting). No body – repeat the request.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+        '400':
+          description: '`timeout` outside `1..60`; `after` is neither a UUID nor an RFC 3339 time.'
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                timeout:
+                  value: { error: bad_request, message: timeout must be between 1 and 60 }
+                after:
+                  value: { error: bad_request, message: after must be a message id or RFC 3339 time }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: >-
+            The mailbox does not exist, has expired or was deleted – during the wait too (noticed within 5 s);
+            `after` is the `id` of a message that is not in the mailbox.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                mailbox:
+                  value: { error: not_found, message: mailbox not found or expired }
+                after:
+                  value: { error: not_found, message: message in after not found }
+        '429':
+          description: >-
+            `too_many_waits` – the user already has `concurrentWaits` waits open (or the server-wide cap is
+            reached), `Retry-After: 1`; `rate_limit_exceeded` – the rate limit.
+          headers:
+            Retry-After:
+              $ref: '#/components/headers/RetryAfter'
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                tooManyWaits:
+                  value: { error: too_many_waits, message: too many concurrent waits }
+                rateLimit:
+                  value: { error: rate_limit_exceeded, message: rate limit exceeded }
+        default:
+          $ref: '#/components/responses/Error'
+
+  /v1/mailboxes/{address}/messages/{id}:
+    parameters:
+      - $ref: '#/components/parameters/Address'
+      - $ref: '#/components/parameters/MessageId'
+    get:
+      tags: [Messages]
+      operationId: getMessage
+      summary: Get a full message
+      description: >-
+        Bodies, attachments, and every code (`codes[0]` is the best guess) and link (`links[0]` is the best guess
+        for "confirm / sign in") found in it, computed on read. For `UNPARSED` and `OVERFLOW`, `html`/`text` are
+        `null` and the lists are empty.
+      responses:
+        '200':
+          description: The message.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetailedMessage'
+              example:
+                id: 3c1b5f0e-6a8e-4b0e-9d3e-1f2a7c9b8e41
+                createdAt: '2026-10-22T09:05:12.481Z'
+                from: { name: null, address: sender@example.com }
+                subject: 048213 is your verification code
+                bodyState: STORED
+                html: "<p>Your verification code is <b>048213</b>.</p>\r\n<a href=\"https://example.com/\">Home</a>\r\n<a href=\"https://click.example.net/ls/click?upn=u001.abc\">Verify email</a>"
+                text: null
+                attachments:
+                  - { id: 9a7e2c44-0d0b-4f7a-a1c1-2b9d5f3e6a10, contentType: application/pdf, fileName: invoice.pdf, sizeBytes: 51234 }
+                codes: ['048213']
+                links:
+                  - { url: 'https://click.example.net/ls/click?upn=u001.abc', text: Verify email }
+                  - { url: 'https://example.com/', text: Home }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/MessageNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Error'
+
+    delete:
+      tags: [Messages]
+      operationId: deleteMessage
+      summary: Delete a message
+      description: Permanently, together with its attachments. The mailbox and the quota do not change. Deleting it again returns `404`.
+      responses:
+        '204':
+          description: Deleted.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/MessageNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Error'
+
+  /v1/mailboxes/{address}/messages/{id}/raw:
+    parameters:
+      - $ref: '#/components/parameters/Address'
+      - $ref: '#/components/parameters/MessageId'
+    get:
+      tags: [Messages]
+      operationId: downloadMessageRaw
+      summary: Download the raw EML
+      description: >-
+        The EML byte for byte, as stored (with our `Received` header on top). For `UNPARSED`, it is the only way
+        to read the message; `OVERFLOW` has no EML and returns `404`.
+      responses:
+        '200':
+          description: The EML bytes.
+          headers:
+            Content-Disposition:
+              required: true
+              description: '`attachment; filename="<id>.eml"`.'
+              schema:
+                type: string
+              example: 'attachment; filename="3c1b5f0e-6a8e-4b0e-9d3e-1f2a7c9b8e41.eml"'
+            Content-Security-Policy:
+              $ref: '#/components/headers/DownloadCSP'
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            message/rfc822:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/MessageNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Error'
+
+  /v1/mailboxes/{address}/messages/{id}/attachments/{attachmentId}:
+    parameters:
+      - $ref: '#/components/parameters/Address'
+      - $ref: '#/components/parameters/MessageId'
+      - name: attachmentId
+        in: path
+        required: true
+        description: UUID of an attachment of this message (`attachments[].id`).
+        schema:
+          type: string
+          format: uuid
+        example: 9a7e2c44-0d0b-4f7a-a1c1-2b9d5f3e6a10
+    get:
+      tags: [Messages]
+      operationId: downloadAttachment
+      summary: Download an attachment
+      description: The decoded bytes (base64/quoted-printable removed). `UNPARSED` and `OVERFLOW` have no attachments and return `404`.
+      responses:
+        '200':
+          description: >-
+            The attachment bytes. `Content-Type` is the attachment's type from the message, or
+            `application/octet-stream` if it has none.
+          headers:
+            Content-Disposition:
+              required: true
+              description: >-
+                `attachment; filename="<ASCII version of the name>"; filename*=UTF-8''<percent-encoded name>`
+                (RFC 5987); with no name – `attachment; filename="<attachmentId>"`.
+              schema:
+                type: string
+              example: "attachment; filename=\"invoice.pdf\"; filename*=UTF-8''invoice.pdf"
+            Content-Security-Policy:
+              $ref: '#/components/headers/DownloadCSP'
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            '*/*':
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/MessageNotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Error'
+
+  # ───────────────────────────── Domains ─────────────────────────────
+  /v1/domains:
+    get:
+      tags: [Domains]
+      operationId: listDomains
+      summary: List domains
+      description: >-
+        Domains the user can create a mailbox on: `PUBLIC` for everyone, `PREMIUM` for plans with
+        `allowPremiumDomains`. Sorted by `name`.
+      responses:
+        '200':
+          description: The list of domains.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Domains'
+              example:
+                domains:
+                  - { name: example.net, type: PREMIUM }
+                  - { name: example.org, type: PUBLIC }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Error'
+
+  # ───────────────────────────── Limits ─────────────────────────────
+  /v1/limits:
+    get:
+      tags: [Limits]
+      operationId: getLimits
+      summary: Get my limits
+      description: The numbers that apply to the caller right now. Does not spend quota (spends one request of the rate limit).
+      responses:
+        '200':
+          description: Quota, limits and storage.
+          headers:
+            X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+            X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+            X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Limits'
+              example:
+                quota: { limit: 20, used: 3, resetsAt: '2026-11-01T00:00:00.000Z' }
+                requestsPerMinute: 60
+                concurrentWaits: 10
+                storage: { usedBytes: 18422, limitBytes: 52428800 }
+                mailboxTtlSeconds: 86400
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        default:
+          $ref: '#/components/responses/Error'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: fep
+      description: >-
+        `Authorization: Bearer fep_<43 base64url characters>`. The key is issued on the website and shown only
+        once. A missing header, or a key that is unknown, revoked or expired – `401`.
+
+  parameters:
+    # Общие для трёх спек (common.md, «Общие компоненты OpenAPI»): PageQuery, SizeQuery.
+    PageQuery:
+      name: page
+      in: query
+      required: false
+      description: Zero-based page number; a negative one is `400`.
+      schema:
+        type: integer
+        minimum: 0
+        default: 0
+    SizeQuery:
+      name: size
+      in: query
+      required: false
+      description: Page size, `1..50`; out of range is `400`.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 50
+        default: 20
+    Address:
+      name: address
+      in: path
+      required: true
+      description: >-
+        Address of the caller's active API mailbox, `localPart@domain`, case-insensitive; `@` as is or as `%40`.
+        Expired, deleted, someone else's, created on the website and nonexistent mailboxes are indistinguishable:
+        all return `404`.
+      schema:
+        type: string
+      example: quiet.harbor.42@example.org
+    MessageId:
+      name: id
+      in: path
+      required: true
+      description: UUID of a message in this mailbox.
+      schema:
+        type: string
+        format: uuid
+      example: 3c1b5f0e-6a8e-4b0e-9d3e-1f2a7c9b8e41
+
+  headers:
+    # Общий для трёх спек: RetryAfter.
+    RetryAfter:
+      description: Seconds to wait before retrying; at least 1.
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+      example: 11
+    RateLimitLimit:
+      description: >-
+        Requests per minute on the plan (`requestsPerMinute`). Sent on every response after the key check; if
+        the headers are absent, the limit state is unknown (the request was let through without being counted),
+        not zero.
+      schema:
+        type: integer
+        minimum: 0
+      example: 60
+    RateLimitRemaining:
+      description: Requests left in the current window after this one.
+      schema:
+        type: integer
+        minimum: 0
+      example: 59
+    RateLimitReset:
+      description: End of the current window, as Unix time in seconds.
+      schema:
+        type: integer
+        format: int64
+      example: 1792659660
+    DownloadCSP:
+      description: Always `sandbox`.
+      required: true
+      schema:
+        type: string
+      example: sandbox
+
+  responses:
+    Error:
+      description: >-
+        An error not listed on the operation: `400 bad_request` (a parameter of the wrong type),
+        `401 unauthorized`, `403 plan_forbidden` (the plan has no API access), `404 not_found` (unknown path),
+        `405 method_not_allowed` (with `Allow`), `413 payload_too_large`, `415 unsupported_media_type`,
+        `500 internal_server_error`, `503 internal_server_error` (the server is temporarily out of database
+        connections or, for a full message and an attachment, its memory budget for reading messages is in use;
+        with `Retry-After`). `X-RateLimit-*` are present if the request reached the rate limiter.
+      headers:
+        X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+        X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+        X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: internal_server_error
+            message: internal server error
+    BadRequest:
+      description: A parameter is invalid, including `page`/`size` out of range.
+      headers:
+        X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+        X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+        X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: bad_request
+            message: size must be between 1 and 50
+    Unauthorized:
+      description: >-
+        No `Authorization: Bearer` header, or a key that is unknown, revoked or expired. The response does
+        not say which; no `X-RateLimit-*`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: unauthorized
+            message: missing or invalid API key
+    MailboxNotFound:
+      description: The caller has no active API mailbox with this address (it expired, was deleted, is someone else's or was created on the website).
+      headers:
+        X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+        X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+        X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: not_found
+            message: mailbox not found or expired
+    MessageNotFound:
+      description: >-
+        No such mailbox (as in `MailboxNotFound`), no such message in it, or no such attachment in the message;
+        `OVERFLOW` has no EML, and `UNPARSED` and `OVERFLOW` have no attachments.
+      headers:
+        X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+        X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+        X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            mailbox:
+              value: { error: not_found, message: mailbox not found or expired }
+            message:
+              value: { error: not_found, message: message not found }
+            raw:
+              value: { error: not_found, message: raw message not stored }
+            attachment:
+              value: { error: not_found, message: attachment not found }
+    QuotaExhausted:
+      description: >-
+        The monthly mailbox quota is exhausted. No `Retry-After`: the quota renews at `resetsAt`, or on moving
+        to a bigger plan.
+      headers:
+        X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+        X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+        X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/QuotaExhaustedError'
+          example:
+            error: quota_exhausted
+            message: monthly mailbox quota exhausted
+            limit: 20
+            used: 20
+            resetsAt: '2026-11-01T00:00:00.000Z'
+            upgradeUrl: https://fake-email.pro/pricing
+    RateLimited:
+      description: 'Rate limit exceeded; `X-RateLimit-Remaining: 0`.'
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
+        X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
+        X-RateLimit-Reset: { $ref: '#/components/headers/RateLimitReset' }
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: rate_limit_exceeded
+            message: rate limit exceeded
+
+  schemas:
+    # ── Общие для трёх спек: ErrorCode, Quota, Storage — копии побайтно (common.md). ──
+    ErrorCode:
+      type: string
+      description: >-
+        Error code. One list for every API of the site; each API returns its own subset – see each
+        operation's responses and `default`.
+      enum:
+        - bad_request
+        - unauthorized
+        - quota_exhausted
+        - forbidden
+        - oauth_required
+        - plan_forbidden
+        - plan_limit_exceeded
+        - not_found
+        - method_not_allowed
+        - address_taken
+        - domain_unavailable
+        - confirmation_required
+        - invalid_state
+        - domain_exists
+        - payload_too_large
+        - unsupported_media_type
+        - rate_limit_exceeded
+        - too_many_waits
+        - internal_server_error
+
+    Quota:
+      type: object
+      description: The monthly quota of Public API mailboxes (calendar month in UTC).
+      required: [limit, used, resetsAt]
+      properties:
+        limit:
+          type: integer
+          minimum: 0
+          description: Public API mailboxes per month on the plan.
+          example: 20
+        used:
+          type: integer
+          minimum: 0
+          description: API mailboxes created since the 1st of the current month in UTC, deleted ones included.
+          example: 3
+        resetsAt:
+          type: string
+          format: date-time
+          description: The 1st of the next month, 00:00 UTC.
+          example: '2026-11-01T00:00:00.000Z'
+
+    Storage:
+      type: object
+      description: Storage taken by the account's messages (per user, across all mailboxes).
+      required: [usedBytes, limitBytes]
+      properties:
+        usedBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Bytes used. When the storage limit goes down (a plan change or a plan edit), messages received before that are not counted and are not evicted.
+          example: 18422
+        limitBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: The plan's limit (`storageBytes`).
+          example: 52428800
+
+    # ── Только Public API. ──
+    Error:
+      type: object
+      description: The Public API error envelope. Tell errors apart by `error`.
+      required: [error, message]
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+          description: A fixed English phrase for the developer; not meant to be parsed.
+          example: localPart requires domain
+
+    QuotaExhaustedError:
+      description: Body of `402 quota_exhausted` – the envelope, the `Quota` fields and a link to the pricing page.
+      allOf:
+        - $ref: '#/components/schemas/Error'
+        - $ref: '#/components/schemas/Quota'
+        - type: object
+          required: [upgradeUrl]
+          properties:
+            upgradeUrl:
+              type: string
+              format: uri
+              description: The website's pricing page.
+              example: https://fake-email.pro/pricing
+
+    Limits:
+      type: object
+      description: The numbers that apply to the caller right now, under their current plan.
+      required: [quota, requestsPerMinute, concurrentWaits, storage, mailboxTtlSeconds]
+      properties:
+        quota:
+          $ref: '#/components/schemas/Quota'
+        requestsPerMinute:
+          type: integer
+          minimum: 0
+          description: Rate limit – requests per minute per user (`X-RateLimit-Limit`).
+          example: 60
+        concurrentWaits:
+          type: integer
+          minimum: 0
+          description: '`wait` requests held open at once per user.'
+          example: 10
+        storage:
+          $ref: '#/components/schemas/Storage'
+        mailboxTtlSeconds:
+          type: integer
+          minimum: 1
+          description: How long a mailbox accepts mail after creation; its messages are deleted together with it.
+          example: 86400
+
+    DomainType:
+      type: string
+      description: '`PREMIUM` is visible only to plans with `allowPremiumDomains`.'
+      enum: [PUBLIC, PREMIUM]
+
+    Domain:
+      type: object
+      required: [name, type]
+      properties:
+        name:
+          type: string
+          description: Domain name in lowercase.
+          example: example.org
+        type:
+          $ref: '#/components/schemas/DomainType'
+
+    Domains:
+      type: object
+      required: [domains]
+      properties:
+        domains:
+          type: array
+          description: Visible domains, sorted by `name`.
+          items:
+            $ref: '#/components/schemas/Domain'
+
+    CreateMailboxRequest:
+      type: object
+      description: '`localPart` without `domain` is `400`. An empty string is a value, not absence (`"domain": ""` → `404`).'
+      properties:
+        localPart:
+          type: [string, 'null']
+          description: >-
+            Lowercased. 1–32 characters of `[a-z0-9._-]`, starting and ending with a letter or digit, no `..`;
+            not `postmaster`, `abuse`, `hostmaster` or `webmaster`. Only on plans with `allowCustomLocalPart`.
+          maxLength: 32
+          example: ci-runner-7
+        domain:
+          type: [string, 'null']
+          description: A domain from `GET /v1/domains`, case-insensitive. If not set, a random visible one.
+          example: example.org
+
+    Mailbox:
+      type: object
+      description: An active API mailbox. It accepts mail for 24 hours after creation, then is deleted together with its messages.
+      required: [address, activeSince, expiresAt, storageUsedBytes, messagesCount]
+      properties:
+        address:
+          type: string
+          description: '`localPart@domain` in lowercase.'
+          example: quiet.harbor.42@example.org
+        activeSince:
+          type: string
+          format: date-time
+          description: Creation time.
+          example: '2026-10-22T09:00:00.000Z'
+        expiresAt:
+          type: string
+          format: date-time
+          description: When the mailbox stops accepting mail; from then on, the mailbox and its messages are `404`.
+          example: '2026-10-23T09:00:00.000Z'
+        storageUsedBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: For reference – the sum of `sizeBytes` of the mailbox's messages. The limit is per account (`storage` in `GET /v1/limits`).
+          example: 18422
+        messagesCount:
+          type: integer
+          minimum: 0
+          description: Number of messages in the mailbox.
+          example: 3
+
+    MailboxPage:
+      type: object
+      description: A page of mailboxes.
+      required: [content, page, size, totalPages, totalElements]
+      properties:
+        content:
+          type: array
+          items:
+            $ref: '#/components/schemas/Mailbox'
+        page:
+          type: integer
+          minimum: 0
+        size:
+          type: integer
+          minimum: 1
+        totalPages:
+          type: integer
+          minimum: 0
+        totalElements:
+          type: integer
+          format: int64
+          minimum: 0
+
+    From:
+      type: object
+      description: The sender, from the `From` header.
+      required: [name, address]
+      properties:
+        name:
+          type: [string, 'null']
+          example: Acme
+        address:
+          type: string
+          example: no-reply@acme.example
+
+    BodyState:
+      type: string
+      description: >-
+        `STORED` – parsed, the body and the EML are kept; `UNPARSED` – could not be parsed, only the EML is kept
+        (no body, attachments, `from` or `subject`); `OVERFLOW` – the message is larger than the account's whole
+        storage, only the headers are kept, no EML, `sizeBytes = 0`.
+      enum: [STORED, UNPARSED, OVERFLOW]
+
+    SimpleMessage:
+      type: object
+      description: A message in the list and in the `wait` response.
+      required: [id, mailboxAddress, createdAt, sizeBytes, from, subject, bodyState, attachmentsCount, code, confirmLink]
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: 3c1b5f0e-6a8e-4b0e-9d3e-1f2a7c9b8e41
+        mailboxAddress:
+          type: string
+          description: Address of the message's mailbox.
+          example: quiet.harbor.42@example.org
+        createdAt:
+          type: string
+          format: date-time
+          description: Delivery time (shown to the millisecond, stored to the microsecond; do not use it as `after`).
+          example: '2026-10-22T09:05:12.481Z'
+        sizeBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: EML size; `0` for `OVERFLOW`.
+          example: 18422
+        from:
+          description: '`null` for `UNPARSED` and for a message without `From`.'
+          oneOf:
+            - $ref: '#/components/schemas/From'
+            - type: 'null'
+        subject:
+          type: [string, 'null']
+          description: Subject; `null` if there is none or the message was not parsed. Never `""`.
+          example: Your verification code
+        bodyState:
+          $ref: '#/components/schemas/BodyState'
+        attachmentsCount:
+          type: integer
+          minimum: 0
+          example: 0
+        code:
+          type: [string, 'null']
+          description: The best one-time code, computed on delivery (= `codes[0]` of the full message); `null` if none.
+          example: '550712'
+        confirmLink:
+          type: [string, 'null']
+          description: The best "confirm / sign in" link, computed on delivery (= `links[0].url`); `null` if none.
+          example: https://acme.example/verify?t=3f9a
+
+    MessagePage:
+      type: object
+      description: A page of messages.
+      required: [content, page, size, totalPages, totalElements]
+      properties:
+        content:
+          type: array
+          items:
+            $ref: '#/components/schemas/SimpleMessage'
+        page:
+          type: integer
+          minimum: 0
+        size:
+          type: integer
+          minimum: 1
+        totalPages:
+          type: integer
+          minimum: 0
+        totalElements:
+          type: integer
+          format: int64
+          minimum: 0
+
+    Attachment:
+      type: object
+      required: [id, contentType, fileName, sizeBytes]
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: 9a7e2c44-0d0b-4f7a-a1c1-2b9d5f3e6a10
+        contentType:
+          type: string
+          description: MIME type as declared by the sender, without parameters.
+          example: application/pdf
+        fileName:
+          type: [string, 'null']
+          description: File name as declared by the sender (up to 1000 characters); `null` if there is none.
+          example: invoice.pdf
+        sizeBytes:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Size of the decoded content.
+          example: 51234
+
+    Link:
+      type: object
+      required: [url, text]
+      properties:
+        url:
+          type: string
+          description: '`http://`/`https://` only.'
+          example: https://acme.example/verify?t=3f9a
+        text:
+          type: [string, 'null']
+          description: Visible link text (or the image's `alt`); `null` for bare URLs.
+          example: Verify email
+
+    DetailedMessage:
+      type: object
+      description: The full message. Attachments are in the order of the message's parts.
+      required: [id, createdAt, from, subject, bodyState, html, text, attachments, codes, links]
+      properties:
+        id:
+          type: string
+          format: uuid
+        createdAt:
+          type: string
+          format: date-time
+        from:
+          description: '`null` for `UNPARSED` and for a message without `From`.'
+          oneOf:
+            - $ref: '#/components/schemas/From'
+            - type: 'null'
+        subject:
+          type: [string, 'null']
+          description: Subject; `null` if there is none or the message was not parsed.
+        bodyState:
+          $ref: '#/components/schemas/BodyState'
+        html:
+          type: [string, 'null']
+          description: The HTML part; `null` if there is none, and for `UNPARSED`/`OVERFLOW`.
+        text:
+          type: [string, 'null']
+          description: The plain-text part (never derived from the HTML); `null` if there is none, and for `UNPARSED`/`OVERFLOW`.
+        attachments:
+          type: array
+          items:
+            $ref: '#/components/schemas/Attachment'
+        codes:
+          type: array
+          description: One-time codes, computed on read; `codes[0]` is the best guess.
+          items:
+            type: string
+          example: ['048213']
+        links:
+          type: array
+          description: Links ranked by how likely they are to "confirm / sign in"; `links[0]` is the best guess.
+          items:
+            $ref: '#/components/schemas/Link'

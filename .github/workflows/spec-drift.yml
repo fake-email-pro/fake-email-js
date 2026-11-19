@@ -1,0 +1,27 @@
+name: Spec drift
+
+# The SDK's copy of the OpenAPI spec must match what the API serves; a drift means the SDK needs regenerating.
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch the live spec
+        run: curl --fail --silent --show-error --location --retry 3 -o /tmp/live.yaml https://api.fake-email.pro/docs/public.yaml
+
+      - name: Compare with openapi/public.yaml
+        run: |
+          if ! diff -u openapi/public.yaml /tmp/live.yaml; then
+            echo "::error::openapi/public.yaml differs from https://api.fake-email.pro/docs/public.yaml. Copy the live spec into openapi/public.yaml, run 'npm run gen:api', update the client and tests if the API changed, and release."
+            exit 1
+          fi
+          echo "openapi/public.yaml matches the live spec."
