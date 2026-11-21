@@ -16,8 +16,9 @@ info:
     **Limits.** The numbers depend on the plan and can change without a release – read `GET /v1/limits` (your own)
     and `GET /v1/plans` on the website's own origin, e.g. `https://fake-email.pro/v1/plans`, no key needed (every plan).
     - *Rate limit* – requests per minute per user, in a fixed window. Its state is in the `X-RateLimit-Limit`,
-      `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers on every response after the key check; going over
-      is `429 rate_limit_exceeded` with `Retry-After`.
+      `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers on every response that passed the key and plan
+      checks (not on `401` or `403 plan_forbidden` for a plan without API access); going over is
+      `429 rate_limit_exceeded` with `Retry-After`.
     - *Quota* – mailboxes per calendar month in UTC. Only `POST /v1/mailboxes` spends it; running out is `402`.
     - *Waits* – `wait` requests held open at once per user; past the cap, `429 too_many_waits` with `Retry-After: 1`.
 
@@ -28,6 +29,10 @@ info:
     `413 payload_too_large`, `415 unsupported_media_type`, `500 internal_server_error`, `503 internal_server_error`
     (the server is temporarily out of database connections or, for a full message and an attachment, its memory
     budget for reading messages is in use; with `Retry-After`).
+
+    **Restarts.** While the server restarts (a deploy), new requests may get `502` for a few seconds – from the
+    proxy in front of the API, not necessarily in the format above; repeat the request. Pending `wait` requests
+    get `204` instead.
 
     **Conventions.** Times are RFC 3339 in UTC, always with milliseconds: `2026-10-22T18:01:02.123Z`. Fields whose
     value is `null` are present; an empty list is `[]`. Enum values are UPPERCASE, error codes lowercase. Lists take
@@ -363,7 +368,7 @@ paths:
 
         Spends one request of the rate limit, however long it is held open. Waits held open at once per user are
         capped at `concurrentWaits` from `GET /v1/limits`; past that, `429 too_many_waits`. When the server
-        restarts, pending waits get `204`.
+        restarts, pending waits get `204`, and new requests may get `502` for a few seconds – repeat the request.
 
         Checks run in this order: `timeout`, `after` format (`400`) → mailbox (`404`) → the message in `after`
         (`404`) → a message already there (`200`) → a wait slot (`429`) → waiting.
@@ -435,7 +440,7 @@ paths:
                 code: '048213'
                 confirmLink: https://acme.example/verify?t=3f9a
         '204':
-          description: No matching message arrived within `timeout` (or the server is restarting). No body – repeat the request.
+          description: No matching message arrived within `timeout` (or the server is restarting; new requests may then get `502` for a few seconds). No body – repeat the request.
           headers:
             X-RateLimit-Limit: { $ref: '#/components/headers/RateLimitLimit' }
             X-RateLimit-Remaining: { $ref: '#/components/headers/RateLimitRemaining' }
@@ -778,9 +783,10 @@ components:
       example: 11
     RateLimitLimit:
       description: >-
-        Requests per minute on the plan (`requestsPerMinute`). Sent on every response after the key check; if
-        the headers are absent, the limit state is unknown (the request was let through without being counted),
-        not zero.
+        Requests per minute on the plan (`requestsPerMinute`). Sent on every response that passed the key and
+        plan checks (not on `401` or `403 plan_forbidden` for a plan without API access); if the headers are
+        absent otherwise, the limit state is unknown (the request was let through without being counted), not
+        zero.
       schema:
         type: integer
         minimum: 0

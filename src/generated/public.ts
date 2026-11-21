@@ -112,7 +112,7 @@ export interface paths {
          *
          *     Spends one request of the rate limit, however long it is held open. Waits held open at once per user are
          *     capped at `concurrentWaits` from `GET /v1/limits`; past that, `429 too_many_waits`. When the server
-         *     restarts, pending waits get `204`.
+         *     restarts, pending waits get `204`, and new requests may get `502` for a few seconds – repeat the request.
          *
          *     Checks run in this order: `timeout`, `after` format (`400`) → mailbox (`404`) → the message in `after`
          *     (`404`) → a message already there (`200`) → a wait slot (`429`) → waiting.
@@ -695,7 +695,7 @@ export interface components {
          */
         RetryAfter: number;
         /**
-         * @description Requests per minute on the plan (`requestsPerMinute`). Sent on every response after the key check; if the headers are absent, the limit state is unknown (the request was let through without being counted), not zero.
+         * @description Requests per minute on the plan (`requestsPerMinute`). Sent on every response that passed the key and plan checks (not on `401` or `403 plan_forbidden` for a plan without API access); if the headers are absent otherwise, the limit state is unknown (the request was let through without being counted), not zero.
          * @example 60
          */
         RateLimitLimit: number;
@@ -1090,7 +1090,7 @@ export interface operations {
                     "application/json": components["schemas"]["SimpleMessage"];
                 };
             };
-            /** @description No matching message arrived within `timeout` (or the server is restarting). No body – repeat the request. */
+            /** @description No matching message arrived within `timeout` (or the server is restarting; new requests may then get `502` for a few seconds). No body – repeat the request. */
             204: {
                 headers: {
                     "X-RateLimit-Limit": components["headers"]["RateLimitLimit"];
