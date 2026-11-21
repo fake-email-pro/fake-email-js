@@ -39,7 +39,11 @@ export class MailboxesResource {
     return this.http.json<Mailbox>({ ...options, method: "GET", path: `/v1/mailboxes/${seg(address)}` });
   }
 
-  /** Deletes the mailbox and its messages. The address is never issued again; the quota is not given back. */
+  /**
+   * Deletes the mailbox and its messages. The address is never issued again; the quota is not given back.
+   * A retry that finds the mailbox gone (the lost first attempt deleted it) counts as success; a `404` on the
+   * first attempt is still a `NotFoundError`.
+   */
   async delete(address: string, options?: RequestOptions): Promise<void> {
     await this.http.send({ ...options, method: "DELETE", path: `/v1/mailboxes/${seg(address)}` });
   }

@@ -65,7 +65,10 @@ export class QuotaExhaustedError extends APIError {
 /** 403 `plan_forbidden`: the plan has no API access, or does not allow a custom `localPart`. */
 export class PermissionDeniedError extends APIError {}
 
-/** 404 `not_found`: the mailbox is not an active API mailbox of yours, or the message/attachment is not there. */
+/**
+ * 404 `not_found`: the mailbox is not an active API mailbox of yours, the message/attachment is not there, the
+ * `domain` given to `mailboxes.create` is unknown or unavailable, or a wait's `after` id names no message.
+ */
 export class NotFoundError extends APIError {}
 
 /** 409 `address_taken`: the address was issued before, to anyone. */
@@ -83,7 +86,10 @@ export class RateLimitError extends APIError {
   }
 }
 
-/** 5xx, including a proxy's 502 during a server restart and 503 `service unavailable`. */
+/**
+ * 5xx, including a proxy's 502 during a server restart, Cloudflare's 520–524 and 503 `service unavailable`
+ * (a 503 with `Retry-After` over 5 s, e.g. no domain available on create, is thrown without retrying).
+ */
 export class InternalServerError extends APIError {}
 
 /** The request did not get a response (DNS, refused connection, reset). */

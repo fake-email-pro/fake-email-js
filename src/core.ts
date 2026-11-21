@@ -35,10 +35,14 @@ export interface CallOptions extends RequestOptions {
 export interface RawResponse {
   status: number;
   headers: Headers;
-  response: Response;
+  /** The whole body, read inside the attempt (its timeout and the caller's signal cover the body too). */
+  body: Uint8Array;
 }
 
 const MAX_RETRY_AFTER_MS = 60_000;
+// A 503 asking for a longer pause (an empty domain pool sends Retry-After: 60) is thrown at once: retrying it
+// inside one call would only stall the caller.
+const MAX_RETRIED_503_AFTER_MS = 5_000;
 const BACKOFF_BASE_MS = 500;
 const BACKOFF_MAX_MS = 8_000;
 
@@ -46,52 +50,65 @@ export class HttpClient {
   constructor(readonly config: HttpConfig) {}
 
   async json<T>(opts: CallOptions): Promise<T> {
-    const { response } = await this.send(opts);
-    return (await response.json()) as T;
+    const { body } = await this.send(opts);
+    return JSON.parse(decode(body)) as T;
   }
 
   /** For `204` endpoints and `wait` (which answers `204` on timeout). */
   async jsonOrNull<T>(opts: CallOptions): Promise<T | null> {
-    const { status, response } = await this.send(opts);
+    const { status, body } = await this.send(opts);
     if (status === 204) return null;
-    const text = await response.text();
+    const text = decode(body);
     return text === "" ? null : (JSON.parse(text) as T);
   }
 
   async send(opts: CallOptions): Promise<RawResponse> {
     const { config } = this;
     const maxRetries = opts.maxRetries ?? config.maxRetries;
-    // DELETE is idempotent here too: a repeated delete is a 404 the caller can tolerate, never a second effect.
+    // DELETE is idempotent here too: a repeated delete is never a second effect.
     const idempotent = opts.method !== "POST";
     const url = this.url(opts.path, opts.query);
     const init = this.init(opts);
+    // Set once an attempt was lost after it may have reached the handler (timeout, connection error, 502/504/52x).
+    let mayHaveApplied = false;
 
     for (let attempt = 0; ; attempt++) {
       opts.signal?.throwIfAborted();
-      let response: Response;
+      let result: { response: Response; body: Uint8Array };
       try {
-        response = await this.attempt(url, init, opts.timeoutMs ?? config.timeoutMs, opts.signal);
+        result = await this.attempt(url, init, opts.timeoutMs ?? config.timeoutMs, opts.signal);
       } catch (err) {
         if (opts.signal?.aborted) throw opts.signal.reason;
         const delay = this.backoff(attempt);
         if (idempotent && attempt < maxRetries && this.fits(delay, opts.deadline)) {
+          mayHaveApplied = true;
           await config.sleep(delay, opts.signal);
           continue;
         }
         throw err;
       }
 
-      if (response.ok) return { status: response.status, headers: response.headers, response };
-
-      const error = await toError(response);
+      const { response, body } = result;
       const status = response.status;
-      // 429 and 503 are refused before any effect, so even POST is safe to repeat; 502/504 may have
+      if (response.ok) return { status, headers: response.headers, body };
+      // The lost attempt did delete it: the repeated DELETE finds nothing, which is the outcome asked for.
+      if (status === 404 && opts.method === "DELETE" && mayHaveApplied) {
+        return { status, headers: response.headers, body: new Uint8Array(0) };
+      }
+
+      const error = toError(response, body);
+      const retryAfter = parseRetryAfter(response.headers.get("retry-after"), config.now());
+      const lost = isGatewayStatus(status);
+      // 429 and 503 are refused before any effect, so even POST is safe to repeat; 502/504/52x may have
       // reached the handler, so only idempotent requests are repeated.
-      const retryable = status === 429 || status === 503 || (idempotent && (status === 502 || status === 504));
+      const retryable =
+        status === 429 ||
+        (status === 503 && (retryAfter === null || retryAfter <= MAX_RETRIED_503_AFTER_MS)) ||
+        (idempotent && lost);
       if (retryable && attempt < maxRetries) {
-        const retryAfter = parseRetryAfter(response.headers.get("retry-after"), config.now());
         const delay = retryAfter === null ? this.backoff(attempt) : Math.min(retryAfter, MAX_RETRY_AFTER_MS);
         if (this.fits(delay, opts.deadline)) {
+          if (lost) mayHaveApplied = true;
           await config.sleep(delay, opts.signal);
           continue;
         }
@@ -100,7 +117,16 @@ export class HttpClient {
     }
   }
 
-  private async attempt(url: string, init: RequestInit, timeoutMs: number, signal?: AbortSignal) {
+  /**
+   * One HTTP attempt, body included: `timeoutMs` and the caller's signal stay armed until the whole body is
+   * read, so a response that stalls after its headers cannot hang the call.
+   */
+  private async attempt(
+    url: string,
+    init: RequestInit,
+    timeoutMs: number,
+    signal?: AbortSignal,
+  ): Promise<{ response: Response; body: Uint8Array }> {
     // AbortSignal.any/timeout are not in Node 18, so the two sources are joined by hand.
     const controller = new AbortController();
     let timedOut = false;
@@ -110,12 +136,27 @@ export class HttpClient {
     }, timeoutMs);
     const onAbort = () => controller.abort(signal?.reason);
     signal?.addEventListener("abort", onAbort, { once: true });
+    const failure = (err: unknown): unknown => {
+      if (signal?.aborted) return signal.reason;
+      if (timedOut) return new APITimeoutError(`request timed out after ${timeoutMs} ms`, { cause: err });
+      return new APIConnectionError(`connection error: ${describe(err)}`, { cause: err });
+    };
     try {
-      return await this.config.fetch(url, { ...init, signal: controller.signal });
-    } catch (err) {
-      if (signal?.aborted) throw signal.reason;
-      if (timedOut) throw new APITimeoutError(`request timed out after ${timeoutMs} ms`, { cause: err });
-      throw new APIConnectionError(`connection error: ${describe(err)}`, { cause: err });
+      let response: Response;
+      try {
+        // Raced against the signal as well, for a custom fetch that ignores it.
+        response = await untilAborted(this.config.fetch(url, { ...init, signal: controller.signal }), controller.signal);
+      } catch (err) {
+        throw failure(err);
+      }
+      try {
+        return { response, body: new Uint8Array(await untilAborted(response.arrayBuffer(), controller.signal)) };
+      } catch (err) {
+        discard(response);
+        if (response.ok || signal?.aborted) throw failure(err);
+        // An unreadable error body still maps by status.
+        return { response, body: new Uint8Array(0) };
+      }
     } finally {
       clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
@@ -155,13 +196,13 @@ export class HttpClient {
   }
 }
 
-async function toError(response: Response): Promise<APIError> {
-  let text = "";
-  try {
-    text = await response.text();
-  } catch {
-    // An unreadable body still maps by status.
-  }
+/** 502, 504 and Cloudflare's 520–524: the request may or may not have reached the server. */
+export function isGatewayStatus(status: number): boolean {
+  return status === 502 || status === 504 || (status >= 520 && status <= 524);
+}
+
+function toError(response: Response, raw: Uint8Array): APIError {
+  const text = decode(raw);
   let body: unknown = text === "" ? null : text;
   if (text !== "") {
     try {
@@ -171,6 +212,38 @@ async function toError(response: Response): Promise<APIError> {
     }
   }
   return errorFromResponse({ status: response.status, headers: response.headers, body });
+}
+
+/** Best effort: frees a body whose reading was given up (a locked or non-web stream is left alone). */
+function discard(response: Response): void {
+  try {
+    void response.body?.cancel().catch(() => {});
+  } catch {
+    // Not a web ReadableStream (a custom fetch): nothing to cancel here.
+  }
+}
+
+function decode(bytes: Uint8Array): string {
+  return new TextDecoder().decode(bytes);
+}
+
+/** `promise`, or a rejection with the signal's reason as soon as the signal aborts. */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
 }
 
 function describe(err: unknown): string {

@@ -29,14 +29,20 @@ export type { components, operations, paths } from "./generated/public.js";
 export interface RequestOptions {
   /** Cancels the call; the promise rejects with the signal's reason. */
   signal?: AbortSignal;
-  /** Overrides the client's `timeoutMs` for each HTTP attempt of this call. */
+  /**
+   * Overrides the client's `timeoutMs` for each HTTP attempt of this call (body included). A `wait` attempt
+   * never gets less than its server timeout + 10 s.
+   */
   timeoutMs?: number;
   /** Overrides the client's `maxRetries` for this call. */
   maxRetries?: number;
 }
 
 export interface CreateMailboxParams {
-  /** Exact local part; requires `domain` and a plan that allows custom local parts. */
+  /**
+   * Local part of the address (the server lowercases it); requires `domain` and a plan that allows custom
+   * local parts.
+   */
   localPart?: string;
   /** A domain from `domains.list()`; random if omitted. */
   domain?: string;
@@ -71,7 +77,10 @@ export interface WaitParams {
 export interface DownloadedAttachment {
   data: Uint8Array;
   contentType: string;
-  /** From `Content-Disposition` (RFC 5987 `filename*` preferred); `null` if absent. */
+  /**
+   * From `Content-Disposition` (RFC 5987 `filename*` preferred). Never `null` from the API: it is the attachment
+   * id when the email gave no name. Chosen by the email's sender: strip directories before using it as a path.
+   */
   fileName: string | null;
 }
 

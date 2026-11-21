@@ -39,7 +39,8 @@ export class MessagesResource {
 
   /**
    * One long poll: the earliest matching message (strictly after `after`), or `null` when the server's
-   * `timeout` passed without one. For a loop with a client-side deadline, use `client.waitForMessage`.
+   * `timeout` passed without one. Each HTTP attempt gets the server timeout + 10 s; `options.timeoutMs` can only
+   * make it longer. For a loop with a client-side deadline, use `client.waitForMessage`.
    */
   wait(address: string, params: WaitParams = {}, options?: RequestOptions): Promise<SimpleMessage | null> {
     return waitOnce(this.http, address, params, options ?? {});
@@ -50,18 +51,22 @@ export class MessagesResource {
     return this.http.json<DetailedMessage>({ ...options, method: "GET", path: `${base(address)}/messages/${seg(id)}` });
   }
 
+  /**
+   * Deletes the message and its attachments. A retry that finds the message gone (the lost first attempt
+   * deleted it) counts as success; a `404` on the first attempt is still a `NotFoundError`.
+   */
   async delete(address: string, id: string, options?: RequestOptions): Promise<void> {
     await this.http.send({ ...options, method: "DELETE", path: `${base(address)}/messages/${seg(id)}` });
   }
 
   /** The raw EML, byte for byte. */
   async raw(address: string, id: string, options?: RequestOptions): Promise<Uint8Array> {
-    const { response } = await this.http.send({
+    const { body } = await this.http.send({
       ...options,
       method: "GET",
       path: `${base(address)}/messages/${seg(id)}/raw`,
     });
-    return new Uint8Array(await response.arrayBuffer());
+    return body;
   }
 
   /** The decoded bytes of an attachment, with its type and file name. */
@@ -71,13 +76,13 @@ export class MessagesResource {
     attachmentId: string,
     options?: RequestOptions,
   ): Promise<DownloadedAttachment> {
-    const { response, headers } = await this.http.send({
+    const { body, headers } = await this.http.send({
       ...options,
       method: "GET",
       path: `${base(address)}/messages/${seg(id)}/attachments/${seg(attachmentId)}`,
     });
     return {
-      data: new Uint8Array(await response.arrayBuffer()),
+      data: body,
       contentType: headers.get("content-type") ?? "application/octet-stream",
       fileName: parseContentDispositionFileName(headers.get("content-disposition")),
     };
@@ -91,9 +96,10 @@ export function waitOnce(
   options: RequestOptions & Pick<CallOptions, "deadline">,
 ): Promise<SimpleMessage | null> {
   const serverTimeoutS = params.timeout ?? DEFAULT_SERVER_WAIT_S;
+  const minTimeoutMs = serverTimeoutS * 1000 + WAIT_HTTP_MARGIN_MS;
   return http.jsonOrNull<SimpleMessage>({
     ...options,
-    timeoutMs: options.timeoutMs ?? serverTimeoutS * 1000 + WAIT_HTTP_MARGIN_MS,
+    timeoutMs: Math.max(options.timeoutMs ?? 0, minTimeoutMs),
     method: "GET",
     path: `${base(address)}/messages/wait`,
     query: {

@@ -100,7 +100,8 @@ test("sign up with an email code", async ({ page, inbox }) => {
   await page.getByLabel("Email").fill(inbox);
   await page.getByRole("button", { name: "Send code" }).click();
 
-  const code = await mail.waitForCode(inbox, { subject: "verification" });
+  // Below the test timeout (Playwright's default is 30 s), leaving time for the steps around it
+  const code = await mail.waitForCode(inbox, { subject: "verification", timeoutMs: 20_000 });
 
   await page.getByLabel("Code").fill(code);
   await page.getByRole("button", { name: "Continue" }).click();
@@ -108,8 +109,9 @@ test("sign up with an email code", async ({ page, inbox }) => {
 });
 ```
 
-Playwright tests run in Node, so the SDK is called directly. Keep the test timeout above `timeoutMs` of the wait
-(Playwright's default is 30 s; `waitForCode` defaults to 60 s).
+Playwright tests run in Node, so the SDK is called directly. Keep the test timeout above `timeoutMs` of the wait:
+Playwright's default is 30 s while `waitForCode` defaults to 60 s, so pass a shorter `timeoutMs` as above, or
+give slow tests more time with `test.setTimeout(90_000)` and wait up to 60 s.
 
 ## Cypress
 
@@ -191,8 +193,9 @@ const second = await mail.waitForMessage(address, { after: first.id });
 server's clock. Prefer a message id: it is exact, while a time depends on clock skew. Do not pass a message's
 `createdAt` as `after`: a second message in the same millisecond would be skipped.
 
-An `after` id that is no longer in the mailbox (you deleted that message) is a `NotFoundError`: if your tests
-delete processed messages, wait without `after`.
+An `after` id you pass that is no longer in the mailbox (you deleted that message) is a `NotFoundError`: if your
+tests delete processed messages, wait without `after`. The helpers' own cursor is safe: when a message they skipped
+(no match, no code) is deleted meanwhile, they continue after its `createdAt` instead.
 
 ### Cancelling
 
@@ -216,7 +219,10 @@ const full = await mail.messages.get(address, message.id);
 full.html; full.text; full.codes; full.links; full.attachments;
 
 const { data, contentType, fileName } = await mail.messages.attachment(address, message.id, full.attachments[0]!.id);
-// data: Uint8Array, e.g. await fs.writeFile(fileName ?? "attachment.bin", data)
+// data: Uint8Array. fileName comes from the email's sender (the attachment id if it gave none): keep only its
+// last path segment, so a name like "../../.bashrc" cannot leave the directory.
+// import { writeFile } from "node:fs/promises"; import { basename, join } from "node:path";
+await writeFile(join("downloads", basename(fileName ?? "") || "attachment.bin"), data);
 
 const eml = await mail.messages.raw(address, message.id); // Uint8Array, the message as received
 
@@ -231,7 +237,7 @@ returns the message or `null` when the server timeout passed.
 ```ts
 await mail.mailboxes.create(); // random address on a random domain
 await mail.mailboxes.create({ domain: "example.org" }); // random address on that domain
-await mail.mailboxes.create({ localPart: "signup-test", domain: "example.org" }); // exactly that address
+await mail.mailboxes.create({ localPart: "signup-test", domain: "example.org" }); // signup-test@example.org
 
 await mail.mailboxes.get(address);
 await mail.mailboxes.list({ page: 0, size: 50 });
@@ -243,7 +249,8 @@ const limits = await mail.limits.get(); // quota, requestsPerMinute, concurrentW
 ```
 
 A mailbox accepts mail for 24 hours and cannot be renewed; after that it answers `404`. Each created mailbox
-spends one unit of your monthly quota (deleting it does not give it back). Custom local parts depend on the plan.
+spends one unit of your monthly quota (deleting it does not give it back). Custom local parts depend on the plan;
+the server lowercases them (`Signup-Test` becomes `signup-test`).
 
 ## Errors
 
@@ -256,12 +263,12 @@ All errors extend `FakeEmailError`. Errors from the server are `APIError` with `
 | `AuthenticationError`   | 401 `unauthorized`: missing, unknown, revoked or expired key                 |
 | `QuotaExhaustedError`   | 402 `quota_exhausted`: monthly mailbox quota spent (`limit`, `used`, `resetsAt`, `upgradeUrl`) |
 | `PermissionDeniedError` | 403 `plan_forbidden`: the plan does not allow this                           |
-| `NotFoundError`         | 404 `not_found`: mailbox expired, deleted or not yours; no such message     |
+| `NotFoundError`         | 404 `not_found`: mailbox expired, deleted or not yours; no such message or attachment; unknown or unavailable `domain` on create; an `after` id that names no message |
 | `ConflictError`         | 409 `address_taken`: the address was issued before                           |
 | `RateLimitError`        | 429: `code` is `rate_limit_exceeded` or `too_many_waits`; `retryAfter` in s  |
-| `InternalServerError`   | 5xx                                                                          |
+| `InternalServerError`   | 5xx, including Cloudflare's 520–524                                          |
 | `APIConnectionError`    | no response (DNS, refused, reset)                                            |
-| `APITimeoutError`       | an HTTP attempt took longer than `timeoutMs`                                 |
+| `APITimeoutError`       | an HTTP attempt (reading the body included) took longer than `timeoutMs`     |
 | `WaitTimeoutError`      | `waitForMessage` / `waitForCode` / `waitForLink` reached their deadline      |
 
 ```ts
@@ -282,12 +289,17 @@ try {
 The client retries up to `maxRetries` times (default 2):
 
 - `429` and `503`, for every method: the server refuses these before doing anything. The wait is `Retry-After`
-  (at most 60 s).
-- `502`, `504`, timeouts and network errors, for `GET` and `DELETE` only, never for `POST` (a mailbox could be
-  created twice). Exponential backoff with jitter: 0.5 s, 1 s, 2 s, ... up to 8 s.
+  (at most 60 s). A `503` asking for more than 5 s (for example no domain available to create a mailbox on,
+  `Retry-After: 60`) is thrown at once as `InternalServerError`, so a call does not stall for a minute.
+- `502`, `504`, Cloudflare's `520`–`524`, timeouts and network errors, for `GET` and `DELETE` only, never for
+  `POST` (a mailbox could be created twice). Exponential backoff with jitter: 0.5 s, 1 s, 2 s, ... up to 8 s.
+- A `DELETE` whose retry gets `404` after such a lost response succeeds: the first attempt did delete it. A `404`
+  on the first attempt is still a `NotFoundError`.
 
-Inside `waitForMessage` and friends, a `429` keeps being waited out while the deadline allows, and no retry is
-started that would end past the deadline.
+`waitForMessage`, `waitForCode` and `waitForLink` handle failures themselves: `429`, `502`, `503`, `504`, `520`–`524`,
+timeouts and network errors are waited out (`Retry-After` if sent, else 1 s, 2 s, then 4 s) until the deadline, and
+then you get `WaitTimeoutError`. No pause and no request runs past the deadline, the full-message read of
+`waitForCode` / `waitForLink` included. `400`, `401`, `402`, `403` and `404` are thrown at once.
 
 Your plan's numbers are in `mail.limits.get()`. Every error carries the window state from the
 `X-RateLimit-*` headers as `err.rateLimit` (`{ limit, remaining, reset }`, or `null` when the server did not send
@@ -299,7 +311,7 @@ them). Each `wait` request counts once, however long it is held open.
 const mail = new FakeEmail({
   apiKey: "fep_...", // default: process.env.FAKE_EMAIL_API_KEY
   baseUrl: "https://api.fake-email.pro", // default
-  timeoutMs: 30_000, // per HTTP attempt; a wait request gets its server timeout + 10 s
+  timeoutMs: 30_000, // per HTTP attempt, body included; a wait request gets its server timeout + 10 s
   maxRetries: 2,
   fetch: customFetch, // default: the global fetch
   userAgent: "my-e2e-suite/1.0", // appended to "fake-email-pro-js/<version>"
